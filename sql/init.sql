@@ -1,0 +1,7 @@
+CREATE EXTENSION IF NOT EXISTS vector;
+
+CREATE TABLE IF NOT EXISTS face_embedding (
+    id SERIAL PRIMARY KEY,
+    embedding VECTOR(512) NOT NULL,
+    name VARCHAR(50) NOT NULL
+);
