@@ -12,7 +12,7 @@ from src.configs import MODEL_MAP, LOSS_MAP
 from src.loss import BatchHardTripletLoss
 from src.metrics import calculate_cosine_similarity, calculate_euclid_distance, classification_metrics, l2_normalize, verification_metrics_report
 
-def load_model(model_type="iresnet", model_size=18, embedding_dim=512, dropout_rate=0.4, sd_path=None):
+def load_model(model_type="iresnet", model_size=18, embedding_dim=512, dropout_rate=0.3, sd_path=None):
     if model_type not in MODEL_MAP:
         choices = ", ".join(MODEL_MAP)
         raise ValueError(f"Unknown model type {model_type!r}. Choose one of: {choices}")
@@ -20,6 +20,8 @@ def load_model(model_type="iresnet", model_size=18, embedding_dim=512, dropout_r
         model = MODEL_MAP[model_type](model_size=model_size, embedding_dim=embedding_dim, dropout=dropout_rate)
     elif model_type == "base":
         model = MODEL_MAP[model_type](embedding_dim=embedding_dim, dropout=dropout_rate)
+    elif model_type == "mobile":
+        model = MODEL_MAP[model_type](embedding_dim=embedding_dim)
     if sd_path is not None:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         sd = torch.load(sd_path, map_location=device)
