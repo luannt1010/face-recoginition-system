@@ -23,6 +23,28 @@ For face identification, pgvector supports vector similarity search using metric
 
 <img src="architecture/model_architec.png" alt="Model Architecture" width="600"/>
 
+## Dataset
+
+Dataset that I used in this project for training model is WebFace 112x112, and some another is used for testing or demo training like ORL Dataset.
+
+Structure of dataset:
+
+```text
+webface_112x112/
+├── person_000001/
+│   ├── 0001.jpg
+│   ├── 0002.jpg
+│   ├── 0003.jpg
+│   └── ...
+├── person_000002/
+│   ├── 0001.jpg
+│   ├── 0002.jpg
+│   └── ...
+├── person_000003/
+│   └── ...
+└── ...
+```
+
 ## Installation
 
 ### 1. Clone Repo
@@ -105,3 +127,12 @@ Run this command to run PyQT App:
 ~~~bash
 python app.py
 ~~~
+
+## Reference
+
+This project is implemented flowing papers:
+
+- AdaFaceLoss: https://arxiv.org/pdf/2204.00964
+- ArcFaceLoss: https://arxiv.org/pdf/1801.07698
+- MobileFaceNet: https://arxiv.org/pdf/1804.07573
+- Iresnet model is got from repo of AdaFaceLoss
