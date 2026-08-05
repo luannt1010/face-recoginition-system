@@ -17,16 +17,16 @@ from PyQt6.QtWidgets import (QApplication, QFileDialog, QHBoxLayout, QLabel, QLi
 from src import (FaceRepository, calculate_area, calculate_center_dist, extract_embedding,
                  load_model, return_landmark, validate_face_pose, crop_face)
 
-MIN_AREA = 0.2
-MAX_AREA = 0.4
+MIN_AREA = 0.01
+MAX_AREA = 0.35
 DIST2CENTER_THRESHOLD = 150
 POSE_THRESHOLD = 7
 OperationMode = Literal["register", "identify"]
 
 PROJECT_ROOT = Path(__file__).resolve().parent
-CHECKPOINT_PATH = (PROJECT_ROOT / "checkpoints" / "final" / "checkpoints" / "best.pth")
+CHECKPOINT_PATH = (PROJECT_ROOT / "checkpoints" / "final5" / "checkpoints" / "best.pth")
 
-MODEL_TYPE = "base"
+MODEL_TYPE = "mobile"
 MODEL_SIZE = 18
 EMBEDDING_DIM = 512
 DROPOUT_RATE = 0.3
