@@ -8,7 +8,7 @@ def get_args():
     parser.add_argument("--img_path1", type=str, required=True)
     parser.add_argument("--img_path2", type=str, required=True)
     parser.add_argument("--cp_path", type=str, default=r".\checkpoints\final\checkpoints\best.pth")
-    parser.add_argument("--model_type", choices=("iresnet", "base"), default="base")
+    parser.add_argument("--model_type", choices=("iresnet", "base", "mobile"), default="mobile")
     parser.add_argument("--model_size", choices=(18, 34, 50, 100, 200), default=18, type=int)
     parser.add_argument("--embedding_dim", type=int, default=512)
     parser.add_argument("--dropout_rate", type=float, default=0.3)
