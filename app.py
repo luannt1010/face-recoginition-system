@@ -12,15 +12,16 @@ import numpy as np
 import torch
 from PyQt6.QtCore import QThread, Qt, pyqtSignal
 from PyQt6.QtGui import QCloseEvent, QImage, QPixmap
-from PyQt6.QtWidgets import (QApplication, QFileDialog, QHBoxLayout, QLabel, QLineEdit,
+from PyQt6.QtWidgets import (QApplication, QHBoxLayout, QLabel, QLineEdit,
                              QMainWindow, QMessageBox, QPushButton, QVBoxLayout, QWidget)
 from src import (FaceRepository, calculate_area, calculate_center_dist, extract_embedding,
-                 load_model, return_landmark, validate_face_pose, crop_face)
+                 FaceDetector, load_model, validate_face_pose, crop_face)
 
 MIN_AREA = 0.01
 MAX_AREA = 0.35
 DIST2CENTER_THRESHOLD = 150
 POSE_THRESHOLD = 7
+
 OperationMode = Literal["register", "identify"]
 
 PROJECT_ROOT = Path(__file__).resolve().parent
@@ -34,18 +35,12 @@ DROPOUT_RATE = 0.3
 SIMILARITY_THRESHOLD = 0.6
 CAPTURE_CONFIRMATION_SECONDS = 0.5
 
+if not CHECKPOINT_PATH.is_file():
+    raise FileNotFoundError(f"Not found checkpoint: {CHECKPOINT_PATH}")
 
-def load_embedding_model(checkpoint_path: str | Path) -> torch.nn.Module:
-    """Nạp model tạo embedding từ checkpoint được chọn."""
-    checkpoint = Path(checkpoint_path).expanduser().resolve()
-    if not checkpoint.is_file():
-        raise FileNotFoundError(f"Not found checkpoint: {checkpoint}")
-    model = load_model(model_type=MODEL_TYPE, model_size=MODEL_SIZE, embedding_dim=EMBEDDING_DIM,
-                       dropout_rate=DROPOUT_RATE, sd_path=str(checkpoint))
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = model.to(device)
-    model.eval()
-    return model
+DETECTOR = FaceDetector()
+EXTRACTOR = load_model(model_type=MODEL_TYPE, model_size=MODEL_SIZE,
+                       embedding_dim=EMBEDDING_DIM, dropout_rate=DROPOUT_RATE, sd_path=str(CHECKPOINT_PATH))
 
 
 def cv_to_qimage(frame_bgr: np.ndarray) -> QImage:
@@ -74,10 +69,18 @@ class CameraWorker(QThread):
 
     error_occurred = pyqtSignal(str)
 
-    def __init__(self, model: torch.nn.Module, mode: OperationMode, name: str | None = None, camera_index: int = 0) -> None:
+    def __init__(
+        self,
+        model: torch.nn.Module,
+        detector: FaceDetector,
+        mode: OperationMode,
+        name: str | None = None,
+        camera_index: int = 0,
+    ) -> None:
         super().__init__()
 
         self.model = model
+        self.detector = detector
         self.mode = mode
         self.name = name
         self.camera_index = camera_index
@@ -151,7 +154,6 @@ class CameraWorker(QThread):
         latest_result_frame: np.ndarray | None = None
 
         best_frame: np.ndarray | None = None
-        success_start_time: float | None = None
 
         def detection_worker() -> None:
             nonlocal latest_result
@@ -172,7 +174,7 @@ class CameraWorker(QThread):
                     continue
 
                 try:
-                    result = return_landmark(frame_copy)
+                    result = self.detector.detect(frame_copy)
 
                 except Exception as exc:
                     self.error_occurred.emit(f"Face detect error: {exc}")
@@ -196,17 +198,6 @@ class CameraWorker(QThread):
 
                 frame_display = frame_orig.copy()
                 cv2.rectangle(frame_display, pt1=[437, 116], pt2=[850, 689], color=(0, 255, 0), thickness=3)
-                # Sau khi đã có frame hợp lệ, vẫn hiển thị camera trực tiếp
-                # để hình không bị đứng hoặc giật trong lúc xác nhận.
-                if success_start_time is not None:
-                    self.frame_ready.emit(cv_to_qimage(frame_display))
-
-                    if (time.perf_counter() - success_start_time >= CAPTURE_CONFIRMATION_SECONDS):
-                        self.emit_status("Face is being processed...")
-                        break
-
-                    time.sleep(0.01)
-                    continue
 
                 with lock:
                     latest_frame = frame_orig.copy()
@@ -219,7 +210,10 @@ class CameraWorker(QThread):
                     self.emit_status("The face has not been identified.")
 
                 else:
-                    (bbox, right_eye, left_eye, nose, mouth_right, mouth_left) = result
+                    bbox = result["bbox"]
+                    right_eye = result["right_eye"]
+                    left_eye = result["left_eye"]
+                    nose = result["nose"]
 
                     # Bbox và landmark phải được áp dụng lên đúng frame đã
                     # đưa vào RetinaFace, tránh crop lệch khi detector chậm.
@@ -242,13 +236,19 @@ class CameraWorker(QThread):
                             if pose_difference > POSE_THRESHOLD:
                                 self.emit_status("Please look straight ahead.")
                             else:
-                                cropped_face = crop_face(detection_frame, bbox, show=False, return_numpy=True)
+                                cropped_face = crop_face(img=detection_frame, bbox=bbox, show=False, return_numpy=True)
                                 if (cropped_face is None or cropped_face.size == 0):
                                     self.emit_status("It's not possible to crop the face.")
                                 else:
-                                    best_frame = cropped_face.copy()
-                                    success_start_time = time.perf_counter()
+                                    best_frame = cropped_face
                                     self.emit_status("Face is detected.")
+                                    self.frame_ready.emit(cv_to_qimage(frame_display))
+
+                                    # Stop queuing camera frames so the GUI can display
+                                    # the detected status immediately and keep it visible.
+                                    if not self._stop_event.wait(CAPTURE_CONFIRMATION_SECONDS):
+                                        self.emit_status("Face is being processed...")
+                                    break
 
                 self.frame_ready.emit(cv_to_qimage(frame_display))
 
@@ -276,15 +276,10 @@ class CameraWorker(QThread):
 
 
 class MainWindow(QMainWindow):
-    def __init__(
-        self,
-        model: torch.nn.Module,
-        checkpoint_path: str | Path,
-    ) -> None:
+    def __init__(self) -> None:
         super().__init__()
 
-        self.model = model
-        self.checkpoint_path = Path(checkpoint_path).resolve()
+        self.model = EXTRACTOR.eval()
         self.worker: CameraWorker | None = None
 
         self.setWindowTitle("Face Recognition System")
@@ -333,32 +328,6 @@ class MainWindow(QMainWindow):
             """
         )
 
-        self.checkpoint_label = QLabel("Checkpoint create embedding:")
-
-        self.checkpoint_path_input = QLineEdit(
-            str(self.checkpoint_path)
-        )
-        self.checkpoint_path_input.setReadOnly(True)
-        self.checkpoint_path_input.setMinimumHeight(40)
-        self.checkpoint_path_input.setToolTip(
-            str(self.checkpoint_path)
-        )
-
-        self.select_checkpoint_button = QPushButton(
-            "Choose checkpoint"
-        )
-        self.select_checkpoint_button.setMinimumHeight(40)
-        self.select_checkpoint_button.clicked.connect(
-            self.select_checkpoint
-        )
-
-        checkpoint_layout = QHBoxLayout()
-        checkpoint_layout.addWidget(self.checkpoint_label)
-        checkpoint_layout.addWidget(
-            self.checkpoint_path_input,
-            stretch=1,
-        )
-        checkpoint_layout.addWidget(self.select_checkpoint_button)
 
         self.name_input = QLineEdit()
         self.name_input.setPlaceholderText(
@@ -406,7 +375,6 @@ class MainWindow(QMainWindow):
 
         layout = QVBoxLayout()
         layout.addWidget(self.camera_label, stretch=1)
-        layout.addLayout(checkpoint_layout)
         layout.addWidget(self.name_input)
         layout.addLayout(action_layout)
         layout.addWidget(self.status_label)
@@ -423,95 +391,8 @@ class MainWindow(QMainWindow):
     ) -> None:
         self.register_button.setEnabled(enabled)
         self.identify_button.setEnabled(enabled)
-        self.select_checkpoint_button.setEnabled(enabled)
         self.stop_camera_button.setEnabled(not enabled)
 
-    def select_checkpoint(self) -> None:
-        """Chọn và nạp checkpoint dùng để tạo embedding."""
-
-        if self.worker is not None and self.worker.isRunning():
-            QMessageBox.information(
-                self,
-                "Camera is running",
-                "Please pause the camera before changing checkpoints.",
-            )
-            return
-
-        selected_path, _ = QFileDialog.getOpenFileName(
-            self,
-            "Select checkpoint model to create embeddings.",
-            str(self.checkpoint_path.parent),
-            "PyTorch checkpoint (*.pth *.pt);; All files (*)",
-        )
-
-        if not selected_path:
-            return
-
-        self.result_label.clear()
-        self.status_label.setText("Loading checkpoint...")
-        self.set_action_buttons_enabled(False)
-        self.stop_camera_button.setEnabled(False)
-
-        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
-        QApplication.processEvents()
-
-        try:
-            new_model = load_embedding_model(selected_path)
-
-        except Exception as exc:
-            self.status_label.setText("Can't load checkpoint")
-            self.result_label.setText("Checkpoint is invalid")
-            self.result_label.setStyleSheet(
-                """
-                QLabel {
-                    font-size: 22px;
-                    font-weight: bold;
-                    color: #c0392b;
-                    padding: 8px;
-                }
-                """
-            )
-            QMessageBox.critical(
-                self,
-                "Error checkpoint",
-                f"Cannot load model from selected checkpoint:\n{exc}",
-            )
-
-        else:
-            previous_model = self.model
-            self.model = new_model
-            self.checkpoint_path = Path(selected_path).resolve()
-
-            self.checkpoint_path_input.setText(
-                str(self.checkpoint_path)
-            )
-            self.checkpoint_path_input.setToolTip(
-                str(self.checkpoint_path)
-            )
-
-            self.status_label.setText("Checkpoint has been successfully loaded.")
-            self.result_label.setText(
-                "The model for creating embeddings has been selected.:\n"
-                f"{self.checkpoint_path.name}"
-            )
-            self.result_label.setStyleSheet(
-                """
-                QLabel {
-                    font-size: 22px;
-                    font-weight: bold;
-                    color: #16833b;
-                    padding: 8px;
-                }
-                """
-            )
-
-            del previous_model
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-
-        finally:
-            QApplication.restoreOverrideCursor()
-            self.set_action_buttons_enabled(True)
 
     def start_registration(self) -> None:
         name = self.name_input.text().strip()
@@ -554,6 +435,7 @@ class MainWindow(QMainWindow):
 
         self.worker = CameraWorker(
             model=self.model,
+            detector=DETECTOR,
             mode=mode,
             name=name,
             camera_index=0,
@@ -669,9 +551,7 @@ class MainWindow(QMainWindow):
         )
 
         self.result_label.setText(
-            "User: Unknown\n"
-            f"Highest Similarity: {similarity:.4f}"
-        )
+            f"Name: Unknown\n - Similarity: {round(similarity, 2)*100}")
 
         self.result_label.setStyleSheet(
             """
@@ -709,12 +589,7 @@ class MainWindow(QMainWindow):
 
 def main() -> int:
     app = QApplication(sys.argv)
-    try:
-        model = load_embedding_model(CHECKPOINT_PATH)
-    except Exception as exc:
-        QMessageBox.critical(None, "Initialization error", f"Unable to load the recognition model.:\n{exc}")
-        return 1
-    window = MainWindow(model=model, checkpoint_path=CHECKPOINT_PATH)
+    window = MainWindow()
     window.show()
     return app.exec()
 
