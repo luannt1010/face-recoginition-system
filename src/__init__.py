@@ -7,9 +7,10 @@ from .utils import (create_data_splits, crop_face, define_transform, extract_emb
                    face_verification, load_model, plot_history, train, create_loss)
 from .database import FaceRepository
 from .alignment import calculate_area, calculate_center_dist, return_landmark, validate_face_pose
+from .detection import FaceDetector
 
 __all__ = ["AdaFaceLoss", "ArcFaceLoss", "BatchHardTripletLoss", "FaceDataset", "IResNetEncoder", "LOSS_MAP",
            "MODEL_MAP", "SimpleResNet", "SubsetFaceDataset", "calculate_cosine_similarity", "calculate_euclid_distance",
            "classification_metrics", "create_data_splits", "create_loss", "crop_face", "define_transform", "extract_embedding", 
            "face_verification", "l2_normalize", "load_model", "plot_history", "train", "verification_metrics_report",
-           "FaceRepository", "calculate_area", "calculate_center_dist", "return_landmark", "validate_face_pose"]
+           "FaceRepository", "calculate_area", "calculate_center_dist", "return_landmark", "validate_face_pose", "FaceDetector"]
