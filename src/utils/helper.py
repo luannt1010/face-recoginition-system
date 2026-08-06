@@ -16,6 +16,7 @@ def load_model(model_type="iresnet", model_size=18, embedding_dim=512, dropout_r
     if model_type not in MODEL_MAP:
         choices = ", ".join(MODEL_MAP)
         raise ValueError(f"Unknown model type {model_type!r}. Choose one of: {choices}")
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     if model_type == "iresnet":
         model = MODEL_MAP[model_type](model_size=model_size, embedding_dim=embedding_dim, dropout=dropout_rate)
     elif model_type == "base":
@@ -23,10 +24,9 @@ def load_model(model_type="iresnet", model_size=18, embedding_dim=512, dropout_r
     elif model_type == "mobile":
         model = MODEL_MAP[model_type](embedding_dim=embedding_dim)
     if sd_path is not None:
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         sd = torch.load(sd_path, map_location=device)
         model.load_state_dict(sd["model"])
-    return model
+    return model.to(device)
 
 def create_loss(loss_type, num_classes, embedding_dim=512, margin=0.4, scale=64.0, t_alpha=0.01):
     if loss_type not in LOSS_MAP:
@@ -47,10 +47,9 @@ def create_data_splits(dataset, val_factor):
 
 def crop_face(img, bbox=None, show=True, return_numpy=False):
     if bbox is None:
-        from retinaface import RetinaFace
-        obj = RetinaFace.detect_faces(img)
-        max_score_obj = max(obj.values(), key=lambda x: x["score"])
-        bbox = max_score_obj["facial_area"]
+        from src.detection import FaceDetector
+        results = FaceDetector().detect(img)
+        bbox = results["bbox"]
     elif bbox is not None:
         bbox = np.asarray(bbox).astype(int)
     else:
@@ -457,8 +456,8 @@ def face_verification(img_path1, img_path2, model, mode="cosine", show=True):
     trans = transforms.Compose([transforms.Resize((112, 112)),
                                 transforms.ToTensor(),
                                 transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])])
-    img1_cropped = crop_face(img=img_path1, show=show)
-    img2_cropped = crop_face(img=img_path2, show=show)
+    img1_cropped = crop_face(img=img_path1, show=show, bbox=None)
+    img2_cropped = crop_face(img=img_path2, show=show, bbox=None)
     img1 = trans(img1_cropped)
     img2 = trans(img2_cropped)
     img1 = img1.to(device)
