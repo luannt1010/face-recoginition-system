@@ -1,12 +1,23 @@
 import numpy as np
-from retinaface import RetinaFace
 
 class FaceDetector:
     def __init__(self):
-        self.model = RetinaFace.build_model()
+        self._retina = None
+        self.model = None
+
+    def _load_model(self):
+        if self.model is not None:
+            return
+        from retinaface import RetinaFace
+        self._retina = RetinaFace
+        self.model = self._retina.build_model()
+
+    def warmup(self):
+        self._load_model()
 
     def detect(self, frame):
-        obj = RetinaFace.detect_faces(frame, model=self.model)
+        self._load_model()
+        obj = self._retina.detect_faces(frame, model=self.model)
         if not obj:
             return None
         max_score_obj = max(obj.values(), key=lambda x: x["score"])
