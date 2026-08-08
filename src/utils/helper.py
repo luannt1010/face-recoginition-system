@@ -76,8 +76,85 @@ def define_transform():
                                         transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])])
     return train_transform, val_transform
 
+def evaluate(model, loss_fn, is_triplet_loss, loader, device, test=False, num_thresholds=400, target_at_far=0.01, epsilon=1e-6):
+    model.eval()
+    loss_fn.eval()
+    running_loss = 0
+    if not is_triplet_loss:
+        all_preds = []
+    all_labels = []
+    all_embeddings = []
+    pbar = tqdm(loader, desc=f"[EVALUATING]", leave=False if not test else True)
+    with torch.no_grad():
+        for images, labels in pbar:
+            images = images.to(device)
+            labels = labels.to(device)
+            embedding = model(images)
+            loss = loss_fn(embedding, labels)
+            running_loss += loss.item()
 
-def train(model, train_loader, val_loader, epochs, optimizer, loss_fn, save_path, device, scheduler, num_thresholds: int=400, target_at_far=0.01, epsilon=1e-6):
+            if not is_triplet_loss:
+                w = loss_fn.W.detach().cpu().numpy()
+                embedding_np = embedding.detach().cpu().numpy()
+                w_norm = l2_normalize(w, epsilon)
+                emb_norm = l2_normalize(embedding_np, epsilon)
+                preds = np.argmax(np.dot(emb_norm, w_norm.T), axis=1)
+                all_preds.extend(preds.tolist())
+            all_labels.extend(labels.detach().cpu().tolist())
+            all_embeddings.append(embedding.detach().cpu())
+
+    total_loss = running_loss / len(loader)
+    classify_metrics = classification_metrics(all_labels, all_preds) if not is_triplet_loss else {}
+    all_embeddings = torch.cat(all_embeddings, dim=0)
+    verify_metrics = verification_metrics_report(all_embeddings, all_labels, num_thresholds=num_thresholds,
+                                                 target_at_far=target_at_far)
+    return total_loss, classify_metrics, verify_metrics
+
+def train_one_epoch(model, train_loader, optimizer, loss_fn, device, is_triplet_loss, epsilon=1e-6):
+    model.train()
+    loss_fn.train()
+    train_running_loss = 0
+    if not is_triplet_loss:
+        train_preds, train_labels = [], []
+    for images, labels in train_loader:
+        images = images.to(device)
+        labels = labels.to(device)
+        optimizer.zero_grad()
+        embedding = model(images)
+        loss = loss_fn(embedding, labels)
+        loss.backward()
+        optimizer.step()
+        if not is_triplet_loss:
+            with torch.no_grad():
+                w = loss_fn.W.detach().cpu().numpy()
+                embedding_np = embedding.detach().cpu().numpy()
+                w_norm = l2_normalize(w, epsilon)
+                emb_norm = l2_normalize(embedding_np, epsilon)
+                preds = np.argmax(np.dot(emb_norm, w_norm.T), axis=1)
+                train_preds.extend(preds.tolist())
+                train_labels.extend(labels.detach().cpu().tolist())
+        train_running_loss += loss.item()
+    train_epoch_loss = train_running_loss / len(train_loader)
+    train_metrics = classification_metrics(train_labels, train_preds)
+    return train_epoch_loss, train_metrics
+
+def create_empty_his():
+    return {"train_loss": [], "val_loss": [], "train_precision": [], "val_precision": [], "total_time": 0,
+               "train_recall": [], "val_recall": [], "train_f1": [], "val_f1": [], "train_acc": [], "val_acc": [],
+               "eer": [], "eer_threshold": [], "tar_at_far": [], "far_at_target": [], "threshold_at_target_far": [], "auc": [], "learning_rate": []}
+
+def save_history(history, save_path):
+    with open(save_path, "w", encoding="utf-8") as f:
+        json.dump(history, f)
+
+def load_history(path):
+    if os.path.exists(path):
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    return create_empty_his()
+
+def train(model, train_loader, val_loader, test_loader, epochs, optimizer, loss_fn, save_path, device, scheduler,
+          num_thresholds: int=400, target_at_far=0.01, epsilon=1e-6, resume=False):
     os.makedirs(save_path, exist_ok=True)
     checkpoint_path = os.path.join(save_path, "checkpoints")
     report_path = os.path.join(save_path, "reports")
@@ -87,120 +164,56 @@ def train(model, train_loader, val_loader, epochs, optimizer, loss_fn, save_path
     best_save_path = os.path.join(checkpoint_path, "best.pth")
     last_save_path = os.path.join(checkpoint_path, "last.pth")
     his_save_path = os.path.join(report_path, "history.json")
+    test_res_save_path = os.path.join(report_path, "test_results.json")
 
-    history = {"train_loss": [], "val_loss": [], "train_precision": [], "val_precision": [],
-               "train_recall": [], "val_recall": [], "train_f1": [], "val_f1": [], "train_acc": [], "val_acc": [],
-               "eer": [], "eer_threshold": [], "tar_at_far": [], "far_at_target": [], "threshold_at_target_far": [], "auc": [], "learning_rate": []}
+    history = load_history(his_save_path) if resume else create_empty_his()
 
     is_triplet_loss = isinstance(loss_fn, BatchHardTripletLoss)
     loss_fn = loss_fn.to(device)
     model = model.to(device)
-    best_score = float("inf")
-    total_time = 0.0
-    for epoch in range(epochs):
-        start = time.perf_counter()
-        model.train()
-        loss_fn.train()
-        train_running_loss = 0
-        if not is_triplet_loss:
-            train_preds, train_labels = [], []
-        train_pbar = tqdm(train_loader, desc=f"Epoch {epoch + 1}/{epochs} [Training]", leave=False)
-        for images, labels in train_pbar:
-            images = images.to(device)
-            labels = labels.to(device)
-            optimizer.zero_grad()
-            embedding = model(images)
-            loss = loss_fn(embedding, labels)
-            loss.backward()
-            optimizer.step()
-            if not is_triplet_loss:
-                with torch.no_grad():
-                    w = loss_fn.W.detach().cpu().numpy()
-                    embedding_np = embedding.detach().cpu().numpy()
-                    w_norm = l2_normalize(w, epsilon)
-                    emb_norm = l2_normalize(embedding_np, epsilon)
-                    preds = np.argmax(np.dot(emb_norm, w_norm.T), axis=1)
-                    train_preds.extend(preds.tolist())
-                    train_labels.extend(labels.detach().cpu().tolist())
-            train_running_loss += loss.item()
+    best_score = 0
+    start_epoch = 0
+    if resume:
+        cp = torch.load(last_save_path, map_location=device)
+        model.load_state_dict(cp["model"])
+        optimizer.load_state_dict(cp["optimizer"])
+        if cp["scheduler"] is not None and scheduler is not None:
+            scheduler.load_state_dict(cp["scheduler"])
+        loss_fn.load_state_dict(cp["loss_fn"])
+        start_epoch = cp["epoch"] + 1
+        best_score = cp["best_score"]
 
-        train_epoch_loss = train_running_loss / len(train_loader)
+    for epoch in range(start_epoch, epochs):
+        start = time.perf_counter()
+        #====================TRAINING====================
+        train_pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{epochs} [Training]", leave=False)
+        train_epoch_loss, train_metrics = train_one_epoch(model, train_pbar, optimizer, loss_fn, device, is_triplet_loss, epsilon)
+
+        #====================VALIDATING====================
+        val_epoch_loss, classify_metrics, verify_metrics = evaluate(model, loss_fn, is_triplet_loss, val_loader, device,
+                                                              test=False, num_thresholds=num_thresholds, target_at_far=target_at_far, epsilon=epsilon)
+
+        end = time.perf_counter()
+        epoch_time = (end - start) / 60
+        history["total_time"] += epoch_time
+
+        tar_at_far = verify_metrics["tar_at_far"]
+        eer_results = verify_metrics["metrics_at_eer"]
+        auc = verify_metrics["auc"]
+        current_eer = eer_results["eer"]
+        current_lr = optimizer.param_groups[0]["lr"]
+        print(f"Epoch {epoch + 1}/{epochs} - {epoch_time:.4f}m: TrLoss={train_epoch_loss:.4f} | ValLoss={val_epoch_loss:.4f} - CurrentLR={current_lr}")
         if not is_triplet_loss:
-            train_metrics = classification_metrics(train_labels, train_preds)
             train_acc = train_metrics["accuracy"]
             train_precision = train_metrics["precision"]
             train_recall = train_metrics["recall"]
             train_f1 = train_metrics["f1"]
 
-        model.eval()
-        loss_fn.eval()
-        val_running_loss = 0
-        if not is_triplet_loss:
-            val_preds = []
-        val_labels = []
-        val_embeddings = []
-        val_pbar = tqdm(val_loader, desc=f"Epoch {epoch + 1}/{epochs} [Validating]", leave=False)
-        with torch.no_grad():
-            for images, labels in val_pbar:
-                images = images.to(device)
-                labels = labels.to(device)
-                embedding = model(images)
-                loss = loss_fn(embedding, labels)
-                val_running_loss += loss.item()
+            val_acc = classify_metrics["accuracy"]
+            val_precision = classify_metrics["precision"]
+            val_recall = classify_metrics["recall"]
+            val_f1 = classify_metrics["f1"]
 
-                if not is_triplet_loss:
-                    w = loss_fn.W.detach().cpu().numpy()
-                    embedding_np = embedding.detach().cpu().numpy()
-                    w_norm = l2_normalize(w, epsilon)
-                    emb_norm = l2_normalize(embedding_np, epsilon)
-                    preds = np.argmax(np.dot(emb_norm, w_norm.T), axis=1)
-                    val_preds.extend(preds.tolist())
-                val_labels.extend(labels.detach().cpu().tolist())
-                val_embeddings.append(embedding.detach().cpu())
-
-        val_epoch_loss = val_running_loss / len(val_loader)
-        if not is_triplet_loss:
-            val_metrics = classification_metrics(val_labels, val_preds)
-            val_acc = val_metrics["accuracy"]
-            val_precision = val_metrics["precision"]
-            val_recall = val_metrics["recall"]
-            val_f1 = val_metrics["f1"]
-        val_embeddings = torch.cat(val_embeddings, dim=0)
-        results = verification_metrics_report(val_embeddings, val_labels, num_thresholds=num_thresholds, target_at_far=target_at_far)
-
-        end = time.perf_counter()
-        epoch_time = (end - start) / 60
-        total_time += epoch_time
-
-        tar_at_far = results["tar_at_far"]
-        eer_results = results["metrics_at_eer"]
-        auc = results["auc"]
-        current_eer = eer_results["eer"]
-        current_lr = optimizer.param_groups[0]["lr"]
-        print(f"Epoch {epoch + 1}/{epochs} - {epoch_time:.4f}m: TrLoss={train_epoch_loss:.4f} | ValLoss={val_epoch_loss:.4f} - CurrentLR={current_lr}")
-        if not is_triplet_loss:
-            print(f"    - Classification(TrAcc={train_acc:.4f} TrP={train_precision:.4f} TrR={train_recall:.4f} TrF1={train_f1:.4f} | ValAcc={val_acc:.4f} ValP={val_precision:.4f} ValR={val_recall:.4f} ValF1={val_f1:.4f})")
-        print(f"    - Verification(TAR@FAR{target_at_far}={tar_at_far['tar@target_far']:.4f} FAR={tar_at_far['far@target_far']:.4f} Threshold={tar_at_far['threshold@target_far']:.4f} | EER={current_eer:.4f} EERThreshold={eer_results['threshold@eer']:.4f} AUC={auc:.4f}) - NumPairs={len(results["pair_labels"])}")
-
-        checkpoints = {"model": model.state_dict(),
-                       "loss_fn": loss_fn.state_dict(),
-                       "optimizer": optimizer.state_dict(),
-                       "epoch": epoch}
-        if current_eer < best_score:
-            best_score = current_eer
-            torch.save(checkpoints, best_save_path)
-        torch.save(checkpoints, last_save_path)
-
-        if scheduler is not None:
-            if isinstance(scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
-                scheduler.step(best_score)
-            else:
-                scheduler.step()
-
-        # Save history
-        history["train_loss"].append(train_epoch_loss)
-        history["val_loss"].append(val_epoch_loss)
-        if not is_triplet_loss:
             history["train_acc"].append(train_acc)
             history["val_acc"].append(val_acc)
             history["train_precision"].append(train_precision)
@@ -209,6 +222,12 @@ def train(model, train_loader, val_loader, epochs, optimizer, loss_fn, save_path
             history["val_recall"].append(val_recall)
             history["train_f1"].append(train_f1)
             history["val_f1"].append(val_f1)
+
+            print(f"    - Classification(TrAcc={train_acc:.4f} TrP={train_precision:.4f} TrR={train_recall:.4f} TrF1={train_f1:.4f} | ValAcc={val_acc:.4f} ValP={val_precision:.4f} ValR={val_recall:.4f} ValF1={val_f1:.4f})")
+        print(f"    - Verification(TAR@FAR{target_at_far}={tar_at_far['tar@target_far']:.4f} FAR={tar_at_far['far@target_far']:.4f} Threshold={tar_at_far['threshold@target_far']:.4f} | EER={current_eer:.4f} EERThreshold={eer_results['threshold@eer']:.4f} AUC={auc:.4f}) - NumPairs={len(verify_metrics["pair_labels"])}")
+
+        history["train_loss"].append(train_epoch_loss)
+        history["val_loss"].append(val_epoch_loss)
         history["eer"].append(current_eer)
         history["eer_threshold"].append(eer_results["threshold@eer"])
         history["tar_at_far"].append(tar_at_far["tar@target_far"])
@@ -217,11 +236,40 @@ def train(model, train_loader, val_loader, epochs, optimizer, loss_fn, save_path
         history["auc"].append(auc)
         history["learning_rate"].append(current_lr)
 
-    history["total_time"] = total_time
-    with open(his_save_path, "w") as f:
-        json.dump(history, f)
-    print(f"History is saved")
-    print(f"Training completely with {total_time:.2f} minutes!")
+        is_best = tar_at_far["tar@target_far"] > best_score
+        if is_best:
+            best_score = tar_at_far["tar@target_far"]
+
+        if scheduler is not None:
+            if isinstance(scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
+                scheduler.step(val_epoch_loss)
+            else:
+                scheduler.step()
+
+        checkpoints = {"model": model.state_dict(),
+                       "loss_fn": loss_fn.state_dict(),
+                       "optimizer": optimizer.state_dict(),
+                       "scheduler": scheduler.state_dict() if scheduler is not None else None,
+                       "epoch": epoch, "best_score": best_score}
+
+        save_history(history, his_save_path)
+        if is_best:
+            torch.save(checkpoints, best_save_path)
+        torch.save(checkpoints, last_save_path)
+
+    test_loss, test_classify_metrics, test_verify_metrics = evaluate(model, loss_fn, is_triplet_loss=is_triplet_loss, loader=test_loader,
+                                                                     test=True, device=device, num_thresholds=num_thresholds, target_at_far=target_at_far)
+
+    test_tar_at_far = test_verify_metrics["tar_at_far"]
+    test_eer_results = test_verify_metrics["metrics_at_eer"]
+    test_auc = test_verify_metrics["auc"]
+    test_eer = test_eer_results["eer"]
+    test_history = {"loss": test_loss, "classify_metrics": test_classify_metrics, "eer": test_eer, "auc": test_auc,
+                    "tar_at_far": test_tar_at_far["tar@target_far"], "eer_threshold": test_eer_results["threshold@eer"],
+                    "far_at_target": test_tar_at_far["far@target_far"], "threshold_at_target_far": test_tar_at_far["threshold@target_far"]}
+    save_history(test_history, test_res_save_path)
+    print(f"Test results is saved")
+    print(f"Testing completely!")
     return history
 
 
