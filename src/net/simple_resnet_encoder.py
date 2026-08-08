@@ -40,9 +40,9 @@ class SimpleResNet(nn.Module):
         self.dropout = dropout
         self.embedding_dim = embedding_dim
         self.extract_embed = nn.Sequential(nn.Flatten(), 
-                                        nn.Linear(256*7*7, 1024), nn.ReLU(), nn.Dropout(self.dropout), 
-                                        nn.Linear(1024, 512), nn.ReLU(), nn.Dropout(self.dropout), 
-                                        nn.Linear(512, self.embedding_dim))
+                                        nn.Linear(256*7*7, 2048), nn.ReLU(), nn.Dropout(self.dropout),
+                                        nn.Linear(2048, 1024), nn.ReLU(), nn.Dropout(self.dropout),
+                                        nn.Linear(1024, self.embedding_dim))
     
     def forward(self, x):
         for block in [self.block1, self.block2, self.block3, self.block4]:
