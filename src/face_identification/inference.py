@@ -13,7 +13,6 @@ def get_args():
     parser.add_argument("--embedding_dim", type=int, default=512)
     parser.add_argument("--dropout_rate", type=float, default=0.3)
     parser.add_argument("--threshold", default=0.4, type=float)
-    parser.add_argument("--mode", choices=("cosine", "euclid"), default="cosine")
     parser.add_argument("--show", action="store_true")
     return parser.parse_args()
 
@@ -27,7 +26,7 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Model is inferring on {device}.")
 
-    cosine, _, _ = face_verification(img_path1=args.img_path1, img_path2=args.img_path2, model=model, mode=args.mode, show=args.show)
+    cosine, _, _ = face_verification(img_path1=args.img_path1, img_path2=args.img_path2, model=model, show=args.show)
     cosine = cosine.item()
     if cosine >= args.threshold:
         print(f"Same identity: score={cosine:.4f}, threshold={args.threshold}")
