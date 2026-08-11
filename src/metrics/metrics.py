@@ -173,6 +173,15 @@ def calculate_auc(metrics):
     auc = np.trapezoid(tar, far)
     return auc
 
+def compute_verify_acc_p_r_f1(metrics):
+    results = []
+    far = metrics[:, 0]
+    frr = metrics[:, 1]
+    best_idx = np.argmin(np.abs(far - frr))
+    for i in [4, 5, 6, 7]:
+        results.append(metrics[best_idx, i])
+    return results
+
 def plot_roc_curve(metrics, title="ROC Curve"):
     far = metrics[:, 0]
     tar = metrics[:, 3]
@@ -210,53 +219,12 @@ def calculate_verification_metrics_multi_thresholds(cosine_scores, pair_labels, 
             metrics[i][j] = results[key]
     return metrics, thresholds
 
-def verification_metrics_report(embeddings, labels, method="cosine", num_thresholds: int=400, target_at_far=0.01):
+def verification_metrics_report(embeddings, labels, num_thresholds: int=400, target_at_far=0.01):
     embedding_left, embedding_right, pair_labels = create_verification_pairs_v3(embeddings, labels)
-    if method not in ["cosine", "euclid"]:
-        raise ValueError("Method have to in (cosine, euclid)")
-    if method == "cosine":
-        scores = calculate_cosine_similarity(embedding_left, embedding_right)
-    else:
-        scores = -calculate_euclid_distance(embedding_left, embedding_right)
+    scores = calculate_cosine_similarity(embedding_left, embedding_right)
     metrics, thresholds = calculate_verification_metrics_multi_thresholds(scores, pair_labels, num_thresholds)
     tar_at_far = calculate_tar_at_far(metrics, thresholds, target_at_far)
     metrics_at_eer = calculate_eer(metrics, thresholds)
-    return {"scores": scores, "pair_labels": pair_labels, "thresholds": thresholds,
-            "metrics": metrics, "tar_at_far": tar_at_far, "metrics_at_eer": metrics_at_eer, "auc": calculate_auc(metrics)}
-
-
-# if __name__ == "__main__":
-#     labels = np.array([0, 0, 1, 1, 2, 2])
-
-#     embeddings = np.array([
-#         [0],  # index 0, label 0
-#         [1],  # index 1, label 0
-#         [2],  # index 2, label 1
-#         [3],  # index 3, label 1
-#         [4],  # index 4, label 2
-#         [5],  # index 5, label 2
-#     ], dtype=np.float32)
-
-#     embedding_left, embedding_right, pair_labels = (
-#     create_verification_pairs_v2(
-#         embeddings,
-#         labels,
-#         seed=42
-#     ))
-#     embedding_left2, embedding_right2, pair_labels2 = (
-#     create_verification_pairs_v3(
-#         embeddings,
-#         labels,
-#         seed=42
-#     ))
-#     print(f"Embedding left v2: {embedding_left}")
-#     print(f"Embedding right v2: {embedding_right}")
-#     print(f"Pair labels v2: {pair_labels}")
-
-#     print(f"Embedding left v3: {embedding_left2}")
-#     print(f"Embedding right v3: {embedding_right2}")
-#     print(f"Pair labels v3: {pair_labels2}")
-
-#     print(embedding_left2==embedding_left)
-#     print(embedding_right==embedding_right2)
-#     print(pair_labels==pair_labels2)
+    acc_p_r_f1 = compute_verify_acc_p_r_f1(metrics)
+    return {"scores": scores, "pair_labels": pair_labels, "thresholds": thresholds, "metrics": metrics, "tar_at_far": tar_at_far,
+            "metrics_at_eer": metrics_at_eer, "auc": calculate_auc(metrics), "acc_p_r_f1": acc_p_r_f1}
