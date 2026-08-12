@@ -1,6 +1,6 @@
 import argparse
 import torch
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Subset
 from src import (FaceDataset, SubsetFaceDataset, create_data_splits, create_loss, define_transform,
                  load_model, plot_history, train)
 
@@ -66,7 +66,34 @@ def main():
     train_transform, val_transform = define_transform()
     train_orig_dataset = FaceDataset(root_dir=train_dir)
     test_dataset = FaceDataset(root_dir=test_dir, transform=val_transform)
-    train_dataset, val_dataset = create_data_splits(train_orig_dataset, val_factor=val_factor)
+
+    model = load_model(model_type, model_size, embedding_dim, dropout_rate, None).to(device)
+    criterion = create_loss(loss_type, num_classes=len(train_orig_dataset.classes), embedding_dim=embedding_dim,
+                            margin=margin, scale=scale, t_alpha=t_alpha).to(device)
+    params = list(model.parameters()) + list(criterion.parameters())
+    optimizer = torch.optim.SGD(params=params, lr=lr, weight_decay=weight_decay, momentum=0.9)
+    # optimizer = torch.optim.AdamW(params=params, lr=lr, weight_decay=weight_decay)
+    scheduler = torch.optim.lr_scheduler.StepLR(optimizer, 10, gamma=0.5)
+
+    start_epoch = 0
+    best_score = float("-inf")
+    if not resume:
+        train_dataset, val_dataset = create_data_splits(train_orig_dataset, val_factor=val_factor)
+    else:
+        cp = torch.load(save_path + "/checkpoints/last.pth", map_location=device)
+        model.load_state_dict(cp["model"])
+        criterion.load_state_dict(cp["loss_fn"])
+        optimizer.load_state_dict(cp["optimizer"])
+        if cp["scheduler"] is not None:
+            scheduler.load_state_dict(cp["scheduler"])
+        start_epoch = cp["epoch"] + 1
+        best_score = cp["best_score"]
+        train_indices = cp["train_indices"]
+        val_indices = cp["val_indices"]
+        train_dataset = Subset(train_orig_dataset, train_indices)
+        val_dataset = Subset(train_orig_dataset, val_indices)
+        print(f"Resume training from epoch {start_epoch + 1}/{num_epochs}")
+
     train_dataset = SubsetFaceDataset(train_dataset, train_transform)
     val_dataset = SubsetFaceDataset(val_dataset, val_transform)
     print(f" Size of train dataset: {len(train_dataset):,}")
@@ -82,17 +109,9 @@ def main():
     test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False,
                              pin_memory=torch.cuda.is_available(), num_workers=num_workers, prefetch_factor=prefetch_factor)
     print("Create dataloader successfully!")
-
-    model = load_model(model_type, model_size, embedding_dim, dropout_rate, None)
     print(f"Total trainable params: {sum(p.numel() for p in model.parameters() if p.requires_grad):,}")
-    criterion = create_loss(loss_type, num_classes=len(train_orig_dataset.classes), embedding_dim=embedding_dim,
-                            margin=margin, scale=scale, t_alpha=t_alpha)
-    optimizer = torch.optim.AdamW(params=list(model.parameters()) + list(criterion.parameters()),
-                                  lr=lr, weight_decay=weight_decay)
-
-    scheduler = torch.optim.lr_scheduler.StepLR(optimizer, 20, gamma=0.1)
-    history = train(model, train_loader, val_loader, test_loader, num_epochs, optimizer, criterion, resume=resume,
-                    save_path=save_path, scheduler=scheduler, device=device, num_thresholds=num_thresholds, target_at_far=target_at_far)
+    history = train(model, train_loader, val_loader, test_loader, num_epochs, optimizer, criterion, resume=resume, start_epoch=start_epoch,
+                    save_path=save_path, scheduler=scheduler, device=device, num_thresholds=num_thresholds, target_at_far=target_at_far, best_score=best_score)
     plot_history(history, save_path)
 
 
