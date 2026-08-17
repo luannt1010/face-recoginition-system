@@ -1,3 +1,4 @@
+import torch
 import torch.nn as nn
 
 class BottleNeck(nn.Module):
@@ -14,12 +15,12 @@ class BottleNeck(nn.Module):
                                        nn.BatchNorm2d(n_expanded), nn.PReLU(n_expanded))
         self.pointwise_down = nn.Sequential(nn.Conv2d(n_expanded, n_out, 1, 1, bias=False),
                                             nn.BatchNorm2d(n_out))
-
+        self.skip_add = torch.ao.nn.quantized.FloatFunctional()
     def forward(self, x):
         identity = x
         output = self.pointwise_down(self.depthwise(self.pointwise_expand(x)))
         if self.stride == 1 and identity.shape[1] == self.n_out:
-            output = output + identity
+            output = self.skip_add.add(output, identity)
         return output
 
 class MakeBlockBottleNeck(nn.Module):
