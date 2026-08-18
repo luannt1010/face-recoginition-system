@@ -4,6 +4,7 @@ import time
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
+import tempfile
 from PIL import Image
 from torch.utils.data import random_split
 from torchvision import transforms
@@ -490,3 +491,41 @@ def export_onnx(model, sp):
     torch.onnx.export(model, dummy_input, sp, export_params=True, opset_version=17, do_constant_folding=True, external_data=False,
                       input_names=["images"], output_names=["predictions"], dynamic_axes={"images": {0: "batch_size"}, "predictions": {0: "batch_size"}})
 
+def get_model_size(model):
+
+    # Create a temporary file using the tempfile module
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".p") as temp_file:
+        # Retrieve the path of the created temporary file
+        temp_file_path = temp_file.name
+        # Save the model's state_dict to the temporary file
+        torch.save(model.state_dict(), temp_file_path)
+
+    # Get the size of the saved file in bytes
+    size_bytes = os.path.getsize(temp_file_path)
+
+    # Convert the size from bytes to megabytes
+    size_mb = size_bytes / (1024 * 1024)
+
+    # Clean up by deleting the temporary file from the system
+    os.remove(temp_file_path)
+
+    # Return the calculated size
+    return size_mb
+
+def measure_average_inference_time_ms(model, input_shape=(1, 3, 112, 112), num_runs=100):
+    device = torch.device("cpu")
+    model.to(device)
+    input_tensor = torch.rand(input_shape).to(device)
+    model.eval()
+    with torch.no_grad():
+        for _ in range(10):
+            model(input_tensor)
+    timings = []
+    with torch.no_grad():
+        for _ in range(num_runs):
+            start_time = time.perf_counter()
+            model(input_tensor)
+            end_time = time.perf_counter()
+            timings.append((end_time - start_time) * 1000)
+    avg_time = sum(timings) / len(timings)
+    return avg_time
