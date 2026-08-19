@@ -1,597 +1,401 @@
-from __future__ import annotations
-
 import sys
-import threading
-import time
-from collections.abc import Mapping
-from pathlib import Path
-from typing import Literal
-
 import cv2
+import requests
 import numpy as np
-import torch
-from PyQt6.QtCore import QThread, Qt, pyqtSignal
-from PyQt6.QtGui import QCloseEvent, QImage, QPixmap
-from PyQt6.QtWidgets import (QApplication, QHBoxLayout, QLabel, QLineEdit,
-                             QMainWindow, QMessageBox, QPushButton, QVBoxLayout, QWidget)
-from src import (FaceRepository, calculate_area, calculate_center_dist, extract_embedding,
-                 FaceDetector, load_model, validate_face_pose, crop_face)
 
-MIN_AREA = 0.01
-MAX_AREA = 0.35
-DIST2CENTER_THRESHOLD = 150
+from PyQt6.QtCore import QTimer, Qt
+from PyQt6.QtGui import QImage, QPixmap, QColor
+from PyQt6.QtWidgets import (QApplication, QLabel, QPushButton, QVBoxLayout,
+                             QWidget, QHBoxLayout, QInputDialog, QMessageBox, QGraphicsDropShadowEffect)
+
+from src.tracker import FaceTracker
+from src.alignment import (calculate_area, calculate_center_dist, validate_face_pose, align_img)
+
+
+WINDOW_SIZE = (1280, 720)
+CAMERA_SIZE = (640, 480)
+THRESHOLD = 0.7
+MIN_AREA = 0.1
+MAX_AREA = 0.3
+DIST2CENTER_THRESHOLD = 30
 POSE_THRESHOLD = 7
+BLUE = (255, 0, 0)
+GREEN = (0, 255, 0)
+RED = (0, 0, 255)
 
-OperationMode = Literal["register", "identify"]
+center_point = (CAMERA_SIZE[0]//2, CAMERA_SIZE[1]//2)
+REGISTER_RECT_PT1 = (center_point[0]-100, center_point[1]-140)
+REGISTER_RECT_PT2 = (center_point[0]+100, center_point[1]+140)
 
-PROJECT_ROOT = Path(__file__).resolve().parent
-CHECKPOINT_PATH = (PROJECT_ROOT / "checkpoints" / "final5" / "checkpoints" / "best.pth")
+WP = r".\checkpoints\test_SGD\checkpoints\face_embedding_model.onnx"
 
-MODEL_TYPE = "mobile"
-MODEL_SIZE = 18
-EMBEDDING_DIM = 512
-DROPOUT_RATE = 0.3
+class APICilent:
+    def __init__(self, base_url="http://127.0.0.1:8000"):
+        self.base_url = base_url
+        self.session = requests.Session()
 
-SIMILARITY_THRESHOLD = 0.6
-CAPTURE_CONFIRMATION_SECONDS = 0.5
+    def _encode_img(self, frame):
+        success, encoded = cv2.imencode(".jpg", frame)
+        if not success:
+            raise RuntimeError("Cannot encode frame.")
+        return encoded.tobytes()
 
-if not CHECKPOINT_PATH.is_file():
-    raise FileNotFoundError(f"Not found checkpoint: {CHECKPOINT_PATH}")
+    def detect_many_faces(self, frame):
+        frame = self._encode_img(frame)
+        files = {"file": frame}
+        response = self.session.post(url=f"{self.base_url}/detection/detect_many_faces", files=files)
+        response.raise_for_status()
+        faces = response.json()
+        results = []
+        if not faces or len(faces) == 0:
+            return results
+        print("STATUS:", response.status_code)
+        print("RESPONSE:", response.text)
+        for face in faces:
+            face["bbox"] = np.asarray(face["bbox"], dtype=np.float32)
+            face["kps"] = np.asarray(face["kps"], dtype=np.float32)
+            results.append(face)
+        return results
 
-DETECTOR = FaceDetector()
-EXTRACTOR = load_model(model_type=MODEL_TYPE, model_size=MODEL_SIZE,
-                       embedding_dim=EMBEDDING_DIM, dropout_rate=DROPOUT_RATE, sd_path=str(CHECKPOINT_PATH))
+    def detect_one_face(self, frame):
+        frame = self._encode_img(frame)
+        files = {"file": frame}
+        response = self.session.post(url=f"{self.base_url}/detection/detect_one_face", files=files)
+        response.raise_for_status()
+        face = response.json()
+        result = []
+        if not face or len(face) == 0:
+            return result
+        print("STATUS:", response.status_code)
+        print("RESPONSE:", response.text)
+        for f in face:
+            f["bbox"] = np.asarray(f["bbox"], dtype=np.float32)
+            f["kps"] = np.asarray(f["kps"], dtype=np.float32)
+            result.append(f)
+        return result
 
+    def search_embedding(self, embedding):
+        response = self.session.post(url=f"{self.base_url}/database/search", json={"embedding": embedding.tolist()})
+        print("STATUS:", response.status_code)
+        print("RESPONSE:", response.text)
+        response.raise_for_status()
+        return response.json()
 
-def cv_to_qimage(frame_bgr: np.ndarray) -> QImage:
-    """Chuyển ảnh OpenCV BGR thành QImage."""
-    frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
-    height, width, channels = frame_rgb.shape
-    bytes_per_line = channels * width
-    image = QImage(frame_rgb.data, width, height, bytes_per_line, QImage.Format.Format_RGB888)
-    return image.copy()
+    def insert_embedding(self, embedding, name):
+        response = self.session.post(url=f"{self.base_url}/database/insert", json={"embedding": embedding.tolist(),
+                                                                                   "name": str(name)})
+        print("STATUS:", response.status_code)
+        print("BODY:", response.text)
+        response.raise_for_status()
+        return response.json()
 
-
-def create_face_embedding(model: torch.nn.Module, face_bgr: np.ndarray) -> np.ndarray:
-    if face_bgr is None or face_bgr.size == 0:
-        raise ValueError("The image shows an empty face.")
-    embedding = extract_embedding(model, face_bgr, show=False, crop=False)
-    return embedding
-
-
-class CameraWorker(QThread):
-    frame_ready = pyqtSignal(QImage)
-    status_changed = pyqtSignal(str)
-
-    registered = pyqtSignal(str, QImage)
-    recognized = pyqtSignal(str, float, QImage)
-    unknown = pyqtSignal(float, QImage)
-
-    error_occurred = pyqtSignal(str)
-
-    def __init__(
-        self,
-        model: torch.nn.Module,
-        detector: FaceDetector,
-        mode: OperationMode,
-        name: str | None = None,
-        camera_index: int = 0,
-    ) -> None:
+    def extract(self, frame):
+        frame = self._encode_img(frame)
+        files = {"file": frame}
+        response = self.session.post(url=f"{self.base_url}/extraction/extract", files=files)
+        print("STATUS:", response.status_code)
+        print("RESPONSE:", response.text)
+        response.raise_for_status()
+        result = response.json()
+        return np.asarray(result["embedding"], dtype=np.float32)
+    
+class FaceRecognitionSys(QWidget):
+    def __init__(self):
         super().__init__()
-
-        self.model = model
-        self.detector = detector
-        self.mode = mode
-        self.name = name
-        self.camera_index = camera_index
-
-        self._stop_event = threading.Event()
-        self._last_status: str | None = None
-
-    def stop(self) -> None:
-        self._stop_event.set()
-
-    def emit_status(self, message: str) -> None:
-        if message != self._last_status:
-            self._last_status = message
-            self.status_changed.emit(message)
-
-    def process_captured_face(self, best_frame: np.ndarray) -> None:
-        """Đăng ký hoặc nhận diện ảnh khuôn mặt đã crop."""
-
-        embedding = create_face_embedding(model=self.model, face_bgr=best_frame)
-        repository = FaceRepository()
-        try:
-            captured_image = cv_to_qimage(best_frame)
-            if self.mode == "register":
-                if not self.name:
-                    raise ValueError("The username cannot be left blank.")
-
-                repository.insert_embedding(embedding=embedding, name=self.name)
-                self.registered.emit(self.name, captured_image,)
-                return
-
-            result = repository.search(embedding)
-            if result is None:
-                self.unknown.emit(0.0, captured_image)
-                return
-
-            # connection.py cấu hình dict_row, nhưng vẫn hỗ trợ tuple để
-            # FaceRepository có thể đổi row factory mà app không bị lỗi.
-            if isinstance(result, Mapping):
-                name = result["name"]
-                similarity = result["similarity"]
-            else:
-                name, similarity = result
-            similarity = float(similarity)
-            if similarity < SIMILARITY_THRESHOLD:
-                self.unknown.emit(similarity, captured_image)
-                return
-            self.recognized.emit(str(name), similarity, captured_image)
-        finally:
-            repository.close()
-
-    def run(self) -> None:
-        self._stop_event.clear()
-        self._last_status = None
-
-        camera = cv2.VideoCapture(self.camera_index)
-
-        if not camera.isOpened():
-            self.error_occurred.emit("The camera can't turn on.")
-            return
-
-        camera.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
-        camera.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
-
-        lock = threading.Lock()
-        detector_stop_event = threading.Event()
-
-        latest_frame: np.ndarray | None = None
-        latest_frame_id = 0
-
-        latest_result = None
-        latest_result_frame: np.ndarray | None = None
-
-        best_frame: np.ndarray | None = None
-
-        def detection_worker() -> None:
-            nonlocal latest_result
-            nonlocal latest_result_frame
-
-            last_processed_frame_id = -1
-
-            while (not self._stop_event.is_set() and not detector_stop_event.is_set()):
-                frame_copy = None
-                current_frame_id = -1
-                with lock:
-                    current_frame_id = latest_frame_id
-                    if (latest_frame is not None and current_frame_id != last_processed_frame_id):
-                        frame_copy = latest_frame.copy()
-
-                if frame_copy is None:
-                    time.sleep(0.01)
-                    continue
-
-                try:
-                    result = self.detector.detect(frame_copy)
-
-                except Exception as exc:
-                    self.error_occurred.emit(f"Face detect error: {exc}")
-                    self._stop_event.set()
-                    return
-
-                with lock:
-                    latest_result = result
-                    latest_result_frame = frame_copy
-                last_processed_frame_id = current_frame_id
-        detector_thread = threading.Thread(target=detection_worker, daemon=True)
-        detector_thread.start()
-
-        try:
-            while not self._stop_event.is_set():
-                ret, frame_orig = camera.read()
-
-                if not ret:
-                    self.error_occurred.emit("Can't read frame from camera.")
-                    break
-
-                frame_display = frame_orig.copy()
-                cv2.rectangle(frame_display, pt1=[437, 116], pt2=[850, 689], color=(0, 255, 0), thickness=3)
-
-                with lock:
-                    latest_frame = frame_orig.copy()
-                    latest_frame_id += 1
-
-                    result = latest_result
-                    result_frame = latest_result_frame
-
-                if result is None or result_frame is None:
-                    self.emit_status("The face has not been identified.")
-
-                else:
-                    bbox = result["bbox"]
-                    right_eye = result["right_eye"]
-                    left_eye = result["left_eye"]
-                    nose = result["nose"]
-
-                    # Bbox và landmark phải được áp dụng lên đúng frame đã
-                    # đưa vào RetinaFace, tránh crop lệch khi detector chậm.
-                    detection_frame = result_frame.copy()
-                    distance_to_center = calculate_center_dist( detection_frame, bbox)
-
-                    if distance_to_center > DIST2CENTER_THRESHOLD:
-                        self.emit_status("Please center your face in the frame.")
-                    else:
-                        face_size = calculate_area(detection_frame, bbox)
-
-                        if face_size <= MIN_AREA:
-                            self.emit_status("Please bring your face closer.")
-                        elif face_size > MAX_AREA:
-                            self.emit_status("Please move your face further away." )
-
-                        else:
-                            nose_to_right, nose_to_left = validate_face_pose(nose, right_eye, left_eye)
-                            pose_difference = abs(nose_to_left - nose_to_right)
-                            if pose_difference > POSE_THRESHOLD:
-                                self.emit_status("Please look straight ahead.")
-                            else:
-                                cropped_face = crop_face(img=detection_frame, bbox=bbox, show=False, return_numpy=True)
-                                if (cropped_face is None or cropped_face.size == 0):
-                                    self.emit_status("It's not possible to crop the face.")
-                                else:
-                                    best_frame = cropped_face
-                                    self.emit_status("Face is detected.")
-                                    self.frame_ready.emit(cv_to_qimage(frame_display))
-
-                                    # Stop queuing camera frames so the GUI can display
-                                    # the detected status immediately and keep it visible.
-                                    if not self._stop_event.wait(CAPTURE_CONFIRMATION_SECONDS):
-                                        self.emit_status("Face is being processed...")
-                                    break
-
-                self.frame_ready.emit(cv_to_qimage(frame_display))
-
-        except Exception as exc:
-            self.error_occurred.emit(f"Camera stream processing error: {exc}")
-            self._stop_event.set()
-        finally:
-            detector_stop_event.set()
-
-            camera.release()
-
-            detector_thread.join()
-
-        if self._stop_event.is_set():
-            return
-
-        if best_frame is None:
-            return
-
-        try:
-            self.process_captured_face(best_frame)
-
-        except Exception as exc:
-            self.error_occurred.emit(f"Face processing error: {exc}")
-
-
-class MainWindow(QMainWindow):
-    def __init__(self) -> None:
-        super().__init__()
-
-        self.model = EXTRACTOR.eval()
-        self.worker: CameraWorker | None = None
 
         self.setWindowTitle("Face Recognition System")
-        self.resize(1000, 780)
+        self.resize(WINDOW_SIZE[0], WINDOW_SIZE[1])
 
-        self.camera_label = QLabel("The camera is not turned on.")
-        self.camera_label.setAlignment(
-            Qt.AlignmentFlag.AlignCenter
-        )
-        self.camera_label.setMinimumSize(900, 550)
-        self.camera_label.setStyleSheet(
-            """
-            QLabel {
-                background-color: #202020;
-                color: white;
-                border-radius: 8px;
-            }
-            """
-        )
+        self.cap = None
+        self.mode = None
+        self.register_name = None
 
-        self.status_label = QLabel("Ready")
-        self.status_label.setAlignment(
-            Qt.AlignmentFlag.AlignCenter
-        )
-        self.status_label.setStyleSheet(
-            """
-            QLabel {
-                font-size: 18px;
-                font-weight: 600;
-                padding: 8px;
-            }
-            """
-        )
-
-        self.result_label = QLabel("")
-        self.result_label.setAlignment(
-            Qt.AlignmentFlag.AlignCenter
-        )
-        self.result_label.setStyleSheet(
-            """
-            QLabel {
-                font-size: 22px;
-                font-weight: bold;
-                padding: 8px;
-            }
-            """
-        )
+        self.tracker = FaceTracker(fps=30)
+        self.api_cilent = APICilent()
+        self.identity_cache = {}
 
 
-        self.name_input = QLineEdit()
-        self.name_input.setPlaceholderText(
-            "Enter the name of the person to be registered."
-        )
-        self.name_input.setMinimumHeight(40)
-        self.name_input.setMaxLength(50)
+        self.camera_label = QLabel()
+        self.camera_label.setFixedSize(CAMERA_SIZE[0], CAMERA_SIZE[1])
 
-        self.register_button = QPushButton(
-            "Register your face."
-        )
-        self.register_button.setMinimumHeight(45)
-        self.register_button.clicked.connect(
-            self.start_registration
-        )
+        self.camera_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.black_pixmap = QPixmap(CAMERA_SIZE[0], CAMERA_SIZE[1])
+        self.black_pixmap.fill(Qt.GlobalColor.black)
+        self.camera_label.setPixmap(self.black_pixmap)
 
-        self.identify_button = QPushButton(
-            "Facial Recognition"
-        )
-        self.identify_button.setMinimumHeight(45)
-        self.identify_button.clicked.connect(
-            self.start_identification
-        )
+        self.recognize_button = QPushButton("Run Recognize")
+        self.register_button = QPushButton("Register Face")
+        self.stop_button = QPushButton("Stop Camera")
+        self.quit_button = QPushButton("Quit App")
 
-        self.stop_camera_button = QPushButton(
-            "Stop Camera"
-        )
-        self.stop_camera_button.setMinimumHeight(45)
-        self.stop_camera_button.clicked.connect(
-            self.stop_camera
-        )
-        self.stop_camera_button.setEnabled(False)
-
-        self.close_button = QPushButton(
-            "Quit App"
-        )
-        self.close_button.setMinimumHeight(45)
-        self.close_button.clicked.connect(self.close)
-
-        action_layout = QHBoxLayout()
-        action_layout.addWidget(self.register_button)
-        action_layout.addWidget(self.identify_button)
-        action_layout.addWidget(self.stop_camera_button)
-        action_layout.addWidget(self.close_button)
-
-        layout = QVBoxLayout()
-        layout.addWidget(self.camera_label, stretch=1)
-        layout.addWidget(self.name_input)
-        layout.addLayout(action_layout)
-        layout.addWidget(self.status_label)
-        layout.addWidget(self.result_label)
-
-        container = QWidget()
-        container.setLayout(layout)
-
-        self.setCentralWidget(container)
-
-    def set_action_buttons_enabled(
-        self,
-        enabled: bool,
-    ) -> None:
-        self.register_button.setEnabled(enabled)
-        self.identify_button.setEnabled(enabled)
-        self.stop_camera_button.setEnabled(not enabled)
+        button_style = """QPushButton {background-color: #343A40; color: white; font-size: 18px; font-weight: bold;
+        min-height: 20px; padding: 8px 22px; border: 2px solid #4B5259; border-radius: 10px;}
+        QPushButton:hover {background-color: #495057; border: 2px solid #6C757D;}
+        QPushButton:pressed {background-color: #212529;}
+        QPushButton:disabled {background-color: #2A2A2A; color: #888888; border: 2px solid #333333;}"""
+        quit_button_style = """QPushButton {background-color: rgb(255, 0, 0); color: white; font-size: 18px; font-weight: bold;
+        min-height: 20px; padding: 8px 22px; border: 2px solid #4B5259; border-radius: 10px;}
+        QPushButton:hover {background-color: #495057; border: 2px solid #6C757D;}
+        QPushButton:pressed {background-color: #212529;}
+        QPushButton:disabled {background-color: #2A2A2A; color: #888888; border: 2px solid #333333;}"""
+        self.add_shadow(self.recognize_button)
+        self.add_shadow(self.register_button)
+        self.add_shadow(self.stop_button)
+        self.add_shadow(self.quit_button)
+        self.recognize_button.setStyleSheet(button_style)
+        self.register_button.setStyleSheet(button_style)
+        self.stop_button.setStyleSheet(button_style)
+        self.quit_button.setStyleSheet(quit_button_style)
+        self.stop_button.setEnabled(False)
 
 
-    def start_registration(self) -> None:
-        name = self.name_input.text().strip()
+        self.main_layout = QVBoxLayout()
+        camera_layout = QVBoxLayout()
+        camera_layout.addWidget(self.camera_label, alignment=Qt.AlignmentFlag.AlignCenter)
+        button_layout = QHBoxLayout()
+        button_layout.addWidget(self.recognize_button)
+        button_layout.addWidget(self.register_button)
+        button_layout.addWidget(self.stop_button)
+        button_layout.addWidget(self.quit_button)
+        self.main_layout.addLayout(camera_layout)
+        self.main_layout.addLayout(button_layout)
+        self.setLayout(self.main_layout)
 
+        self.timer = QTimer()
+        self.timer.timeout.connect(self.update_frame)
+
+        self.recognize_button.clicked.connect(self.start_recognize)
+        self.register_button.clicked.connect(self.start_register)
+        self.stop_button.clicked.connect(self.stop_camera)
+        self.quit_button.clicked.connect(self.close)
+
+    def add_shadow(self, button):
+        shadow = QGraphicsDropShadowEffect(self)
+
+        shadow.setBlurRadius(18)
+        shadow.setOffset(0, 5)
+        shadow.setColor(QColor(0, 0, 0, 200))
+
+        button.setGraphicsEffect(shadow)
+
+    def open_camera(self):
+        if self.cap is not None:
+            return True
+        self.cap = cv2.VideoCapture(0)
+        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, CAMERA_SIZE[0])
+        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, CAMERA_SIZE[1])
+        if not self.cap.isOpened():
+            QMessageBox.critical(self, "Camera Error", "Cannot open camera.")
+            self.cap.release()
+            self.cap = None
+            return False
+        return True
+
+    def start_recognize(self):
+        if not self.open_camera():
+            return
+        self.mode = "recognize"
+        self.register_name = None
+        self.identity_cache.clear()
+        # Button state
+        self.recognize_button.setEnabled(False)
+        self.register_button.setEnabled(False)
+        self.stop_button.setEnabled(True)
+
+        self.timer.start(30)
+
+    def start_register(self):
+        name, ok = QInputDialog.getText(self, "Register Face", "Enter your name:")
+        if not ok:
+            return
+        name = name.strip()
         if not name:
-            QMessageBox.warning(
-                self,
-                "Name missing",
-                "Please enter the name of the person you wish to register.",
-            )
+            QMessageBox.warning(self, "Invalid Name", "Name cannot be empty.")
             return
 
-        self.start_camera_worker(
-            mode="register",
-            name=name,
-        )
+        if not self.open_camera():
+            return
+        self.register_name = name
+        self.mode = "register"
+        self.identity_cache.clear()
+        # Button state
+        self.recognize_button.setEnabled(False)
+        self.register_button.setEnabled(False)
+        self.stop_button.setEnabled(True)
+        self.timer.start(30)
 
-    def start_identification(self) -> None:
-        self.start_camera_worker(
-            mode="identify",
-        )
+    def stop_camera(self):
+        self.timer.stop()
+        if self.cap is not None:
+            self.cap.release()
+            self.cap = None
+        self.mode = None
+        self.register_name = None
+        self.identity_cache.clear()
+        self.camera_label.setPixmap(self.black_pixmap)
+        # Button state
+        self.stop_button.setEnabled(False)
+        self.recognize_button.setEnabled(True)
+        self.register_button.setEnabled(True)
 
-    def start_camera_worker(
-        self,
-        mode: OperationMode,
-        name: str | None = None,
-    ) -> None:
-        if self.worker is not None and self.worker.isRunning():
-            QMessageBox.information(
-                self,
-                "Camera is running",
-                "Please wait for the current camera to complete.",
+    def validate_face(self, frame, bbox, landmarks):
+        distance_to_center = calculate_center_dist(frame, bbox)
+        if distance_to_center > DIST2CENTER_THRESHOLD:
+            return (False, "Pls, center your face in the frame.")
+
+        face_size = calculate_area(frame, bbox)
+        if face_size <= MIN_AREA:
+            return (False, "Pls, bring your face closer.")
+        if face_size >= MAX_AREA:
+            return (False, "Pls, move your face further away.")
+
+        nose = landmarks[2]
+        right_eye = landmarks[0]
+        left_eye = landmarks[1]
+
+        nose_to_right, nose_to_left = validate_face_pose(nose, right_eye, left_eye)
+        pose_difference = abs(nose_to_left - nose_to_right)
+        if pose_difference > POSE_THRESHOLD:
+            return (False, "Pls, look straight ahead.")
+        return True, None
+
+    def draw_warning(self, frame, message):
+        cv2.putText(img=frame, text=message, org=(20, 75),fontFace=cv2.FONT_HERSHEY_SIMPLEX,
+                    fontScale=1.0, color=RED, thickness=2)
+
+    def process_recognize(self, frame):
+        faces = self.api_cilent.detect_many_faces(frame)
+        tracks = self.tracker.update(faces)
+
+        for track in tracks:
+            track_id = track["track_id"]
+            bbox = track["bbox"]
+            landmarks = track["landmarks"]
+
+            if track_id not in self.identity_cache:
+                valid, message = self.validate_face(frame, bbox, landmarks)
+                if not valid:
+                    self.draw_warning(frame, message)
+                    continue
+
+                aligned_frame = align_img(frame, landmarks)
+                embedding = self.api_cilent.extract(aligned_frame)
+                results = self.api_cilent.search_embedding(embedding)
+                similarity = results["similarity"]
+                if similarity < THRESHOLD:
+                    results["name"] = "Unknown"
+                self.identity_cache[track_id] = results
+            else:
+                results = self.identity_cache[track_id]
+            name, similarity = list(results.values())
+            x1, y1, x2, y2 = bbox
+            cv2.rectangle(frame, (x1, y1), (x2, y2), GREEN, 2)
+            text = (
+                f"ID:{track_id} "
+                f"{name} "
+                f"{similarity:.2f}"
             )
+            cv2.putText(img=frame, text=text, org=(x1, y1 - 10), fontFace=cv2.FONT_HERSHEY_SIMPLEX,
+                        fontScale=0.6, color=GREEN, thickness=2)
+        return frame
+
+    def process_register(self, frame):
+        # copy only for display guide, main frame for insert
+        frame_display = frame.copy()
+        cv2.rectangle(frame_display, pt1=REGISTER_RECT_PT1, pt2=REGISTER_RECT_PT2, color=GREEN, thickness=3)
+        faces = self.api_cilent.detect_one_face(frame)
+        if faces is None or len(faces) == 0:
+            self.draw_warning(frame_display, "No face detected.")
+            return frame_display
+        face = faces[0]
+        bbox = face["bbox"]
+        landmarks = face["kps"]
+
+        valid, message = self.validate_face(frame, bbox, landmarks)
+        if not valid:
+            self.draw_warning(frame_display, message)
+            return frame_display
+
+        aligned_frame = align_img(frame, landmarks)
+        embedding = self.api_cilent.extract(aligned_frame)
+        try:
+            self.api_cilent.insert_embedding(embedding, self.register_name)
+        except Exception as e:
+            QMessageBox.critical(self, "Register Error", f"Cannot register face:\n{e}")
+            return frame_display
+        # Insert successfully and keep aligned face on screen
+        self.finish_register(aligned_frame)
+        # None for not display live frame
+        return None
+
+    def finish_register(self, aligned_frame):
+
+        # save name before reset
+        registered_name = self.register_name
+        self.timer.stop()
+        if self.cap is not None:
+            self.cap.release()
+            self.cap = None
+        self.mode = None
+        self.register_name = None
+        self.identity_cache.clear()
+        # displayt frame face cut instead live face
+        self.display_frame(aligned_frame)
+
+        self.stop_button.setEnabled(False)
+        self.recognize_button.setEnabled(True)
+        self.register_button.setEnabled(True)
+
+        QMessageBox.information(self, "Register Success",(f"Face registered successfully for {registered_name}."))
+
+    # main camera loop
+    def update_frame(self):
+        if self.cap is None:
             return
 
-        self.result_label.clear()
-        self.status_label.setText("Opening camera...")
+        ret, frame = self.cap.read()
+        if not ret:
+            return
+        
+        if self.mode == "recognize":
+            frame = self.process_recognize(frame)
+        elif self.mode == "register":
+            frame = self.process_register(frame)
 
-        self.set_action_buttons_enabled(False)
+            # Register successfully
+            # finish_register() self displayed aligned face 
+            if frame is None:
+                return
+        # display live frame for recognize mode
+        self.display_frame(frame)
 
-        self.worker = CameraWorker(
-            model=self.model,
-            detector=DETECTOR,
-            mode=mode,
-            name=name,
-            camera_index=0,
-        )
+    def display_frame(self, frame):
+        if frame is None:
+            return
+        
+        frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        height, width, channel = (frame_rgb.shape)
+        bytes_per_line = (channel * width)
+        # NUMPY -> QIMAGE
+        q_image = QImage(frame_rgb.data, width, height, bytes_per_line, QImage.Format.Format_RGB888)
+        # QIMAGE -> QPIXMAP
+        pixmap = QPixmap.fromImage(q_image )
 
-        self.worker.frame_ready.connect(
-            self.update_camera_frame
-        )
+        self.camera_label.setPixmap(pixmap.scaled(self.camera_label.size(),
+                                                  Qt.AspectRatioMode.KeepAspectRatio,
+                                                  Qt.TransformationMode.SmoothTransformation))
 
-        self.worker.status_changed.connect(
-            self.status_label.setText
-        )
-
-        self.worker.registered.connect(
-            self.show_registration_result
-        )
-
-        self.worker.recognized.connect(
-            self.show_recognition_result
-        )
-
-        self.worker.unknown.connect(
-            self.show_unknown_result
-        )
-
-        self.worker.error_occurred.connect(
-            self.show_error
-        )
-
-        self.worker.finished.connect(
-            self.on_worker_finished
-        )
-
-        self.worker.start()
-
-    def stop_camera(self) -> None:
-        if self.worker is not None and self.worker.isRunning():
-            self.worker.stop()
-            self.status_label.setText("Stopping camera...")
-
-    def update_camera_frame(self, image: QImage) -> None:
-        pixmap = QPixmap.fromImage(image)
-
-        scaled_pixmap = pixmap.scaled(
-            self.camera_label.size(),
-            Qt.AspectRatioMode.KeepAspectRatio,
-            Qt.TransformationMode.SmoothTransformation,
-        )
-
-        self.camera_label.setPixmap(scaled_pixmap)
-
-    def show_registration_result(
-        self,
-        name: str,
-        captured_image: QImage,
-    ) -> None:
-        self.update_camera_frame(captured_image)
-
-        self.status_label.setText(
-            "Face registration successful"
-        )
-
-        self.result_label.setText(
-            f"Registration successful: {name}"
-        )
-
-        self.result_label.setStyleSheet(
-            """
-            QLabel {
-                font-size: 22px;
-                font-weight: bold;
-                color: #16833b;
-                padding: 8px;
-            }
-            """
-        )
-
-    def show_recognition_result(
-        self,
-        name: str,
-        similarity: float,
-        captured_image: QImage,
-    ) -> None:
-        self.update_camera_frame(captured_image)
-
-        self.status_label.setText(
-            "Face recognition successful"
-        )
-
-        self.result_label.setText(
-            f"Name: {name} - Similarity: {round(similarity, 2)*100}%"
-        )
-        self.result_label.setStyleSheet(
-            """
-            QLabel {
-                font-size: 22px;
-                font-weight: bold;
-                color: #16833b;
-                padding: 8px;
-            }
-            """
-        )
-
-    def show_unknown_result(
-        self,
-        similarity: float,
-        captured_image: QImage,
-    ) -> None:
-        self.update_camera_frame(captured_image)
-
-        self.status_label.setText(
-            "User not identified"
-        )
-
-        self.result_label.setText(
-            f"Name: Unknown\n - Similarity: {round(similarity, 2)*100}")
-
-        self.result_label.setStyleSheet(
-            """
-            QLabel {
-                font-size: 22px;
-                font-weight: bold;
-                color: #c0392b;
-                padding: 8px;
-            }
-            """
-        )
-
-    def show_error(self, message: str) -> None:
-        self.status_label.setText(message)
-        self.result_label.setText("An error has occurred.")
-        QMessageBox.critical(self, "Error", message)
-
-    def on_worker_finished(self) -> None:
-        if self.status_label.text() == "Stopping camera...":
-            self.status_label.setText("Stopped camera")
-
-        self.set_action_buttons_enabled(True)
-
-        if self.worker is not None:
-            self.worker.deleteLater()
-            self.worker = None
-
-    def closeEvent(self, event: QCloseEvent) -> None:
-        if self.worker is not None and self.worker.isRunning():
-            self.worker.stop()
-            self.worker.wait(5000)
-
+    def closeEvent(self, event):
+        self.timer.stop()
+        if self.cap is not None:
+            self.cap.release()
+            self.cap = None
+            self.identity_cache.clear()
+        cv2.destroyAllWindows()
         event.accept()
 
-
-def main() -> int:
-    app = QApplication(sys.argv)
-    window = MainWindow()
-    window.show()
-    return app.exec()
-
 if __name__ == "__main__":
-    raise SystemExit(main())
+    app = QApplication(sys.argv)
+    window = FaceRecognitionSys()
+    window.show()
+    sys.exit(app.exec())
