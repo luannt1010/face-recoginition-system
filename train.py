@@ -72,8 +72,7 @@ def main():
                             margin=margin, scale=scale, t_alpha=t_alpha).to(device)
     params = list(model.parameters()) + list(criterion.parameters())
     optimizer = torch.optim.SGD(params=params, lr=lr, weight_decay=weight_decay, momentum=0.9)
-    # optimizer = torch.optim.AdamW(params=params, lr=lr, weight_decay=weight_decay)
-    scheduler = torch.optim.lr_scheduler.StepLR(optimizer, 10, gamma=0.5)
+    scheduler = torch.optim.lr_scheduler.StepLR(optimizer, 20, gamma=0.1)
 
     start_epoch = 0
     best_score = float("-inf")
