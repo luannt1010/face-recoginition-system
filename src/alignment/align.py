@@ -1,6 +1,7 @@
 import cv2
 import numpy as np
 from src.metrics import calculate_euclid_distance
+from insightface.utils import face_align
 
 RADIUS = 5
 MIN_AREA = 0.2
@@ -67,3 +68,6 @@ def draw_img(frame, bbox, right_eye, left_eye, nose, mouth_right, mouth_left):
     img = cv2.circle(img, mouth_right, RADIUS, RED, -1)
     img = cv2.circle(img, mouth_left, RADIUS, RED, -1)
     return img
+
+def align_img(frame, landmarks):
+    return face_align.norm_crop(frame, landmarks, image_size=112)
