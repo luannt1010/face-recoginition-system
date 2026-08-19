@@ -3,14 +3,17 @@ from .dataset import FaceDataset, SubsetFaceDataset
 from .loss import AdaFaceLoss, ArcFaceLoss, BatchHardTripletLoss
 from .metrics import (calculate_cosine_similarity, calculate_euclid_distance, classification_metrics, l2_normalize, verification_metrics_report)
 from .net import IResNetEncoder, SimpleResNet
-from .utils import (create_data_splits, crop_face, define_transform, extract_embedding,
-                   face_verification, load_model, plot_history, train, create_loss)
+from .utils import (create_data_splits, crop_face, define_transform, extract_embedding, evaluate,
+                   face_verification, load_model, plot_history, train, create_loss, get_model_size, measure_average_inference_time_ms)
 from .database import FaceRepository
-from .alignment import calculate_area, calculate_center_dist, return_landmark, validate_face_pose
-from .detection import FaceDetector
+from .alignment import calculate_area, calculate_center_dist, return_landmark, validate_face_pose, align_img
+from .detection import SCRFDDetector, RetinaDetector
+from .tracker import FaceTracker
+from .extractor import Extractor
 
-__all__ = ["AdaFaceLoss", "ArcFaceLoss", "BatchHardTripletLoss", "FaceDataset", "IResNetEncoder", "LOSS_MAP",
+__all__ = ["AdaFaceLoss", "ArcFaceLoss", "BatchHardTripletLoss", "FaceDataset", "IResNetEncoder", "LOSS_MAP", "Extractor",
            "MODEL_MAP", "SimpleResNet", "SubsetFaceDataset", "calculate_cosine_similarity", "calculate_euclid_distance",
            "classification_metrics", "create_data_splits", "create_loss", "crop_face", "define_transform", "extract_embedding", 
-           "face_verification", "l2_normalize", "load_model", "plot_history", "train", "verification_metrics_report",
-           "FaceRepository", "calculate_area", "calculate_center_dist", "return_landmark", "validate_face_pose", "FaceDetector"]
+           "face_verification", "l2_normalize", "load_model", "plot_history", "train", "verification_metrics_report", "FaceTracker",
+           "FaceRepository", "calculate_area", "calculate_center_dist", "return_landmark", "validate_face_pose", "SCRFDDetector", 
+           "RetinaDetector", "get_model_size", "measure_average_inference_time_ms", "evaluate", "align_img"]
